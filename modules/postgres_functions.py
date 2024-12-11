@@ -3,7 +3,7 @@ import numpy as np
 import psycopg2
 from sqlalchemy import create_engine, text
 
-def probar_conexion_postgresql(host, clave, database, user, port):
+def probar_conexion_postgresql(host, user, clave, database, port):
     try:
         conexion = psycopg2.connect(
             host=host,
@@ -282,3 +282,101 @@ def create_sql_script(df, table_name, file_name, index_cols=None, pk_name=None, 
         f.write(sql_script)
 
     print("El archivo SQL con el trigger ha sido generado exitosamente.")
+
+def generate_transaction_script(df, table_name, error_table_name, file_name, primary_key_column=None):
+    """
+    Genera un script SQL dinámico para insertar filas de un DataFrame en PostgreSQL con manejo de errores.
+    Si se proporciona un primary_key_column, se agrega un ON CONFLICT DO UPDATE en el query.
+    
+    Args:
+        df (pd.DataFrame): DataFrame con los datos a insertar.
+        table_name (str): Nombre de la tabla destino.
+        error_table_name (str): Nombre de la tabla para registrar errores.
+        primary_key_column (str, optional): Nombre de la columna de la clave primaria para manejar conflictos.
+    
+    Returns:
+        str: Script SQL.
+    """
+    # Obtener columnas del DataFrame
+    columns = df.columns.tolist()
+    
+    # Generar la lista de columnas en formato SQL
+    columns_sql = ", ".join(columns)
+    
+    # Generar las filas en formato SQL VALUES
+    values = []
+    for row in df.itertuples(index=False):
+        row_values = ", ".join(
+            f"'{x}'" if isinstance(x, str) else "NULL" if pd.isna(x) else str(x)
+            for x in row
+        )
+        values.append(f"({row_values})")
+    
+    values_sql = ",\n            ".join(values)
+
+    # Generar la parte del ON CONFLICT si se pasa la columna de la clave primaria
+    on_conflict_sql = ""
+    if primary_key_column:
+        on_conflict_sql = f"""
+            ON CONFLICT ({primary_key_column}) 
+            DO UPDATE SET {', '.join(f"{col} = EXCLUDED.{col}" for col in columns if col != primary_key_column)}
+        """
+
+    # Generar el script SQL
+    script = f"""
+DO $$
+DECLARE
+    fila RECORD;
+BEGIN
+    -- Iterar sobre las filas a insertar
+    FOR fila IN
+        SELECT * FROM (VALUES
+            {values_sql}
+        ) AS datos({', '.join(columns)})
+    LOOP
+        BEGIN
+            -- Intentar insertar la fila
+            INSERT INTO {table_name} ({columns_sql})
+            VALUES ({', '.join(f'fila.{col}' for col in columns)}) {on_conflict_sql};
+
+        EXCEPTION
+            WHEN unique_violation THEN
+                -- Capturar el conflicto y registrar el error con detalles específicos
+                INSERT INTO {error_table_name} (table_name, error_message, data)
+                VALUES (
+                    '{table_name}', 
+                    'Unique violation error: Conflict in columns {', '.join(columns)}', 
+                    row_to_json(fila)
+                );
+            WHEN foreign_key_violation THEN
+                -- Error de clave foránea
+                INSERT INTO {error_table_name} (table_name, error_message, data)
+                VALUES (
+                    '{table_name}', 
+                    'Foreign key violation error: Invalid foreign key value in row', 
+                    row_to_json(fila)
+                );
+            WHEN check_violation THEN
+                -- Error de violación de restricciones de CHECK
+                INSERT INTO {error_table_name} (table_name, error_message, data)
+                VALUES (
+                    '{table_name}', 
+                    'Check constraint violation error: Invalid value in row',
+                    row_to_json(fila)
+                );
+            WHEN others THEN
+                -- Registrar error general con detalles
+                INSERT INTO {error_table_name} (table_name, error_message, data)
+                VALUES (
+                    '{table_name}', 
+                    'General error: ' || SQLERRM || ' | Row data: ' || row_to_json(fila)::text, 
+                    row_to_json(fila)
+                );
+        END;
+    END LOOP;
+END $$;
+"""
+    with open(file_name, "w") as file:
+        file.write(script)
+    return script
+
